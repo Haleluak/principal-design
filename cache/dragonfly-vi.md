@@ -9,8 +9,10 @@ DragonflyDB được thành lập bởi Roman Gershman (cựu Principal Engineer
 Khác với Redis (vốn dĩ chạy đơn luồng cho việc xử lý lệnh), Dragonfly được xây dựng từ đầu để tận dụng tối đa phần cứng máy chủ đa nhân hiện đại.
 
 ### Thiết kế Shared-Nothing (Không chia sẻ gì cả)
-- **Phân đoạn Dataset:** Dữ liệu được chia thành **N shard (phân đoạn)**, với `N <= số lượng thread` (luồng) của server.
-- **Quy tắc Sở hữu Độc lập:** Mỗi shard được quản lý bởi duy nhất **một thread cố định**.
+- **Phân đoạn Dataset:** Dữ liệu được chia thành **N shard (phân đoạn)**, với `N` là số lượng **Luồng phần cứng (Logical Cores)** của server.
+    - *Ví dụ:* Một server có **4 Core vật lý / 8 Thread**, Dragonfly sẽ chia làm **8 shard** (N=8).
+- **Quy tắc Sở hữu Độc lập:** Mỗi shard được quản lý duy nhất bởi một thread cố định.
+- **CPU Affinity (Pinning):** Dragonfly sẽ "ghim" (pin) từng thread vào một nhân logic cố định để tránh lãng phí chi phí khi Hệ điều hành điều phối (thread bị nhảy qua nhảy lại các core).
 - **Không xảy ra tranh chấp khóa (Lock Contention):** Vì mỗi thread có quyền sở hữu tuyệt đối đối với shard của mình, nó không cần dùng tới `locks` (mutex) để xử lý các lệnh, tránh được hiện tượng thắt cổ chai do tranh giành tài nguyên vốn thường thấy trong các hệ thống đa luồng truyền thống.
 
 ### Giao tiếp giữa các luồng (Message Bus)
@@ -68,11 +70,26 @@ Dragonfly xử lý việc phân bổ lại dữ liệu vượt trội hơn nhờ
 
 ---
 
-## 5. So Sánh: Redis vs Dragonfly
+## 5. Tính Lưu Trữ & Độ Bền Dữ Liệu (Persistence & Durability)
+
+Làm thế nào để Dragonfly đảm bảo không mất dữ liệu khi server bị sập hoặc khởi động lại?
+
+### Chụp Ảnh Dữ Liệu (Snapshotting - Tương thích RDB)
+- Dragonfly hỗ trợ định dạng **Redis RDB**, cho phép bạn lưu toàn bộ dữ liệu từ RAM xuống đĩa cứng cục bộ (thường là SSD hoặc NVMe để đạt tốc độ tối đa).
+- **Lưu Đa Luồng (Multi-threaded Saving):** Khác biệt lớn nhất với Redis (vốn dùng `fork()` và một tiến trình `BGSAVE` đơn lẻ), Dragonfly tận dụng toàn bộ các thread của mình để lưu các shard xuống đĩa **song song**.
+- **Hiệu năng:** Cách tiếp cận song song này giúp việc tạo snapshot nhanh hơn đáng kể và giảm thiểu thời gian "đóng băng" hoặc tốn tài nguyên memory (copy-on-write) trong quá trình lưu.
+
+### Cơ chế Replication (Sao chép)
+- Để đảm bảo độ tin cậy cao nhất, bạn có thể thiết lập mô hình **Master-Replica**. Nếu server chính bị sập, node Replica đã có sẵn bản sao dữ liệu để sẵn sàng thay thế.
+
+---
+
+## 6. So Sánh: Redis vs Dragonfly
 
 | Đặc tính | Redis | Dragonfly |
 | :--- | :--- | :--- |
 | **Luồng (Threading)** | Đơn luồng (Single-thread) | Đa luồng (Shared-nothing) |
+| **Lưu trữ (Persistence)** | Đơn luồng (fork) | Đa luồng (Song song) |
 | **Resharding** | Di cư từng Slot (Mạng) | Truyền đa luồng song song |
 | **Mở rộng** | Ưu tiên chiều ngang (Cluster) | Ưu tiên chiều dọc (Core/RAM) |
 | **Xóa key (Eviction)** | Approx. LRU | 2Q (Mới + Tần suất) |
