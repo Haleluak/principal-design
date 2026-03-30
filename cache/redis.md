@@ -72,17 +72,30 @@ Client -----> Server (read)
 
 ## 4. Traditional Solution: Multi-threading
 
-```
-Client1 → Thread1 (blocked)
-Client2 → Thread2 (blocked)
-Client3 → Thread3 (blocked)
-```
+To solve the issue of threads being blocked while waiting (Blocking I/O), traditional systems create a large number of **OS Threads** to serve multiple clients simultaneously.
 
-### Problems:
+### Deep-dive: Physical Threads vs OS Threads
 
-- High memory usage
-- Context switching overhead
-- Poor scalability
+To understand why many threads cause slowdowns, we must distinguish between:
+
+1.  **Physical Thread (Hardware Thread/Core):** The actual hardware execution unit of the CPU (e.g., a machine with 8 Cores / 16 Hardware Threads). This is the limit of how many tasks can truly run in **parallel** at any given moment.
+2.  **OS Thread (Software Thread):** An abstraction created by the Operating System. You can spawn thousands of OS Threads even if you only have 8 physical cores.
+
+### How the OS "Fakes" Parallelism (Scheduling)
+
+When you have 1000 OS Threads but only 8 physical cores:
+- The OS performs **Scheduling**: It allows Thread 1 to run on Core 1 for a few milliseconds (a quantum), then forcibly stops Thread 1 so Thread 2 can take its place.
+- This process is called **Context Switching**.
+
+### Why is creating many threads expensive?
+
+-   **Memory Overhead:** Each OS Thread requires its own reserved memory area (Stack), typically 1MB - 8MB. With 10,000 threads, you immediately consume ~10GB - 80GB of RAM just for their existence.
+-   **CPU Overhead (Context Switch):** Each time a thread is swapped, the CPU must:
+    1.  Save all registers and the Program Counter of the old thread.
+    2.  Load the state of the new thread.
+    3.  Flush CPU Caches (L1, L2, L3) because the new thread requires completely different data.
+
+> **Conclusion:** When too many OS Threads compete for a few physical cores, the CPU spends most of its time **swapping seats (Context Switching)** rather than actually processing client requests. This is why Redis chooses a Single-thread + epoll approach to maximize the use of a single physical core without the overhead of swapping seats.
 
 ---
 

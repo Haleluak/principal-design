@@ -43,13 +43,30 @@ Mặc định, `read()` là một hành động **chặn (blocking)**.
 
 ## 4. Giải Pháp Truyền Thống: Đa Luồng (Multi-threading)
 
-Để giải quyết việc Thread bị treo khi chờ đợi, các hệ thống cũ tạo ra nhiều Thread:
-- Client 1 → Thread 1 (đang ngủ chờ dữ liệu).
-- Client 2 → Thread 2 (đang ngủ chờ dữ liệu).
+Để giải quyết việc Thread bị treo khi chờ đợi (Blocking), các hệ thống truyền thống tạo ra rất nhiều **OS Threads** để phục vụ nhiều Client cùng lúc.
 
-**Nhược điểm:**
-- Tốn bộ nhớ khủng khiếp để duy trì hàng nghìn Thread.
-- **Context Switching**: Chi phí để OS chuyển đổi giữa các Thread cực kỳ đắt đỏ.
+### Deep-dive: Thread Vật Lý vs Thread OS
+
+Để hiểu tại sao nhiều Thread lại gây chậm, ta cần phân biệt:
+
+1.  **Thread Vật Lý (Hardware Thread/Core):** Là phần cứng thực sự của CPU (ví dụ: máy tính có 8 Core / 16 Thread vật lý). Đây là số lượng công việc thực sự có thể chạy **song song (parallel)** tại một thời điểm.
+2.  **Thread OS (Software Thread):** Là một sự trừu tượng hóa do Hệ điều hành tạo ra. Bạn có thể tạo hàng nghìn Thread OS ngay cả khi chỉ có 8 Core vật lý.
+
+### Cách OS "đánh lừa" chúng ta (Scheduling)
+
+Khi bạn có 1000 Thread OS mà chỉ có 8 Core vật lý:
+- OS sẽ thực hiện **Scheduling**: Nó cho Thread 1 chạy trên Core 1 trong vài mili giây (quantum), sau đó bắt Thread 1 dừng lại để Thread 2 nhảy vào chạy.
+- Hành động này gọi là **Context Switching**.
+
+### Tại sao tạo nhiều Thread lại "đắt"?
+
+-   **Memory Overhead:** Mỗi Thread OS cần một vùng nhớ riêng (Stack) khoảng 1MB - 8MB. Nếu bạn có 10,000 Thread, bạn sẽ tốn ngay ~10GB - 80GB RAM chỉ để... duy trì sự tồn tại của chúng.
+-   **CPU Overhead (Context Switch):** Mỗi lần đổi thread, CPU phải:
+    1.  Lưu toàn bộ các thanh ghi (Registers), Program Counter của thread cũ.
+    2.  Nạp lại trạng thái của thread mới.
+    3.  Làm hỏng CPU Cache (L1, L2, L3) vì thread mới cần dữ liệu khác hoàn toàn thread cũ.
+
+> **Kết luận:** Khi có quá nhiều Thread OS tranh giành vài Core vật lý, CPU sẽ dành phần lớn thời gian để **đổi ghế (Context Switch)** thay vì thực sự xử lý yêu cầu của khách hàng. Đây là lý do Redis chọn hướng đi Single-thread + epoll để tận dụng tối đa 1 Core vật lý mà không tốn phí đổi ghế.
 
 ---
 
