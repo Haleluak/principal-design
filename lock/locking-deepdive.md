@@ -11,10 +11,23 @@ In concurrent programming, protecting data from race conditions is mandatory. Ho
 
 ---
 
-## 2. Mutex: The Pessimistic Approach
+## 2. Mutex: A "Hybrid" Nature
 
-### Mechanism:
-When a thread acquires a Mutex, other threads attempting to access the same logic are **Blocked**. The Operating System (OS) suspends these threads (Context Switch) to save CPU cycles and wakes them up only when the lock is released.
+A common misconception is that Mutex and Atomic are entirely separate entities. In reality, **Mutex is built on top of Atomic.**
+
+### Internal Structure of a Mutex:
+1.  **An Atomic Variable (State):** Represents the lock's status (e.g., 0 for free, 1 for locked).
+2.  **A Wait Queue:** To keep track of threads waiting for the lock if they fail to acquire it.
+
+### The Mutex Workflow (Fast Path vs. Slow Path):
+
+- **Fast Path:** When you call `mu.Lock()`, the very first thing the Mutex does is attempt an **Atomic CAS** (Compare-And-Swap) to flip the state from 0 to 1. If it succeeds immediately (no contention), the Mutex is nearly as fast as an Atomic operation!
+- **Slow Path:** Only when the CAS fails (meaning the lock is already held) does the Mutex invoke the Operating System (OS). At this point, it places the thread into a wait queue and puts it to **Sleep (Block)** to free up the CPU for other tasks.
+
+---
+
+## 3. The Nature of "Blocking" in Mutex
+Unlike Atomic operations that spin in a loop (Active waiting), a "Blocked" thread is suspended by the OS. The OS perform a **Context Switch** to run another thread. The blocked thread consumes zero CPU while sleeping and is "woken up" by the OS only when the lock becomes available.
 
 ### Example (Go):
 ```go

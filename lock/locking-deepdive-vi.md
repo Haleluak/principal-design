@@ -11,10 +11,23 @@ Trong lập trình song song (concurrency), việc bảo vệ dữ liệu khỏi
 
 ---
 
-## 2. Mutex: Cách Tiếp Cận Bi Quan (Pessimistic)
+## 2. Mutex: Bản Chất "Lai" (Hybrid)
 
-### Bản chất:
-Khi một thread chiếm giữ Mutex, các thread khác muốn truy cập vào logic đó sẽ bị **Block**. Hệ điều hành (OS) sẽ treo các thread này lại (Context Switch) để tiết kiệm CPU và chỉ đánh thức khi khóa được mở.
+Một hiểu lầm phổ biến là Mutex hoàn toàn tách biệt với Atomic. Thực tế, **Mutex được xây dựng dựa trên Atomic.**
+
+### Cấu tạo của một Mutex:
+1.  **Một biến Atomic (State):** Thể hiện trạng thái khóa (0: tự do, 1: đang khóa).
+2.  **Một hàng đợi (Wait Queue):** Để lưu danh sách các thread đang chờ nếu không lấy được khóa.
+
+### Luồng xử lý của Mutex (Fast Path và Slow Path):
+
+- **Fast Path (Con đường nhanh):** Khi bạn gọi `mu.Lock()`, việc đầu tiên Mutex làm là thử một lệnh **Atomic CAS** để chuyển trạng thái từ 0 sang 1. Nếu thành công ngay lập tức (không có ai tranh giành), Mutex chạy nhanh y hệt Atomic!
+- **Slow Path (Con đường chậm):** Chỉ khi lệnh CAS thất bại, Mutex mới tìm đến sự trợ giúp của Hệ điều hành (OS). Lúc này nó sẽ đưa thread vào hàng đợi và cho thread **đi ngủ (Sleep/Block)** để nhường CPU cho việc khác.
+
+---
+
+## 3. Bản chất của việc "Block" trong Mutex
+Khi bị "Block", thread của bạn không chạy vòng lặp vô tận (như Atomic), mà nó bị OS treo lại. OS sẽ thực hiện **Context Switch** để chạy thread khác. Khi Mutex được mở, OS mới đánh thức bạn dậy để tiếp tục tranh giành khóa.
 
 ### Ví dụ (Go):
 ```go
