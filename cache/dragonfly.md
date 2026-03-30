@@ -1,222 +1,84 @@
----
+# Dragonfly: The Modern In-Memory Data Store (Deep Dive)
 
-# 14. Resharding & Scaling (Redis vs Dragonfly)
-
-Scaling is not just about adding more nodes —  
-it’s about **how data is redistributed (resharding)** when the cluster changes.
+DragonflyDB is founded by Roman Gershman (ex-AWS ElastiCache Principal Engineer) with a single goal: addressing the inherent architectural limitations of Redis to build "The Fastest In-Memory Data Store."
 
 ---
 
-## 14.1 Redis Scaling & Resharding
+## 1. Core Architecture: Shared-Nothing & Multi-Threading
 
-### Architecture
+Unlike Redis, which is fundamentally single-threaded (with some multi-threaded I/O in v6+), Dragonfly is built from the ground up to leverage modern multi-core hardware.
 
-Redis Cluster:
+### Shared-Nothing Design
+- **Dataset Partitioning:** The dataset is split into **N shards**, where `N <= number of threads`.
+- **Independent Ownership:** Each shard is managed by a single, dedicated thread.
+- **No Lock Contention:** Since a thread has exclusive ownership of its shard, it doesn't need locks (mutexes) to process commands, avoiding the "Lock Contention" bottleneck found in traditional multi-threaded systems.
 
-- Uses **16384 hash slots**
-- Each key is mapped to a slot:
-
-```
-slot = CRC16(key) % 16384
-```
-
-- Each node owns a subset of slots
+### Inter-Thread Communication (Message Bus)
+- Threads communicate via a **Message Bus** (conceptually similar to Go Channels).
+- If a client connects to Thread A but wants data in Shard B (owned by Thread B), Thread A sends a message to Thread B via the bus to process the request.
 
 ---
 
-### Adding a Node
+## 2. Scaling Strategy: Vertical-First
 
-When a new node is added:
+Dragonfly focuses on **Vertical Scaling** (scaling up on a single node) before Horizontal Scaling (Cluster).
 
-1. The cluster assigns some slots from existing nodes to the new node  
-2. Data must be **migrated slot by slot**
-
----
-
-### Resharding Process
-
-```
-Source Node ────► Target Node
-   (slot X)         (slot X)
-```
-
-Steps:
-
-- Lock slot (temporarily)
-- Migrate keys one by one
-- Update cluster metadata
+### Why Vertical first? (Root Square Law)
+- Hardware efficiency: A single large server (Vertical) is often ~20-30% more hardware-cost-efficient than a cluster of smaller servers (Horizontal) with equivalent total capacity.
+- Operational Simplicity: No cluster management, no Sentinels, and no expensive cross-node slot migrations until truly necessary.
 
 ---
 
-### Characteristics
+## 3. "Cutting Edge" Algorithms & Data Structures
 
-- **Online but not free**
-- Causes:
-  - Network overhead  
-  - Increased latency during migration  
-- Requires careful orchestration
+Dragonfly replaces legacy Redis algorithms with modern alternatives:
 
----
+### VLL (Very Lightweight Locking) Protocol
+- Used for **Atomic Transactions** across multiple shards.
+- More advanced and robust than Redis’s `MULTI/EXEC` (which doesn't rollback on individual command failure).
 
-### Removing a Node
+### 2Q Eviction Policy
+- Redis uses an **Approximated LRU** (Least Recently Used), which struggles with "Long Tail" access patterns.
+- Dragonfly uses **2Q**, which tracks both **Recency** and **Frequency** to make better decisions on which keys to evict.
 
-- All slots of that node must be moved to other nodes  
-- Same migration process applies  
-
----
-
-### Key Limitation
-
-> Redis resharding is **explicit and operationally heavy**
+### DashTable
+- Dragonfly uses **DashTable** for its primary (key, value) storage.
+- It consumes **~50% less memory** than Redis's standard HashTable (chaining method) and offers better CPU cache locality.
 
 ---
 
-## 14.2 Dragonfly Scaling & Resharding
+## 4. Resharding & Scaling (Redis vs Dragonfly)
 
-Dragonfly has **two levels of scaling**:
+### 4.1 Redis Scaling: Slot Migration
+Redis Cluster uses **16384 hash slots**.
+- **Mechanism:** Migration happens **slot-by-slot**. The cluster must explicitly move each key in a slot over the network from one node's memory to another's.
+- **The Cost:** Since Redis is single-threaded, it must balance migration work with command processing. This is **explicit and operationally heavy**.
 
----
+### 4.2 Dragonfly Scaling: Multi-Threaded streaming
+Dragonfly handles data redistribution much better due to its **Multi-threaded Shared-Nothing architecture**:
 
-## (A) Vertical Scaling (Within a Node)
+#### A. Vertical Resharding (Within 1 Node)
+- When shifting core counts (e.g., from 4 to 8 threads on one machine), Dragonfly performs an **In-Process Redistribution** during boot.
+- Since it's all within the same RAM space, keys are instantly re-mapped to the new shards/threads. No network cost.
 
-This is where Dragonfly shines.
-
-### Mechanism
-
-- Data is split into **N shards**
-- Each shard is owned by a thread
-
-```
-shard_id = hash(key) % N
-```
-
----
-
-### When Threads Change
-
-If you increase threads:
-
-```
-Old: N = 4
-New: N = 8
-```
-
-→ Shard mapping changes
+#### B. Horizontal Resharding (Swarm Mode)
+- **Parallel Streaming:** Unlike Redis (single-core migration), Dragonfly uses **multiple threads** to stream shards in parallel.
+- **Thread-to-Thread Migration:** Source threads stream their local shards directly to destination threads via multiple parallel TCP connections.
+- **Efficiency:** This makes resharding **orders of magnitude faster** and reduces the "latency stall" period common in Redis clusters.
 
 ---
 
-### Problem
+## 5. Comparison: Redis vs Dragonfly
 
-- `hash(key) % N` is **not stable**
-- Many keys must move between shards
-
----
-
-### Solution
-
-Dragonfly handles this cleanly because vertical scaling is usually an **offline upgrade**:
-
-- Save snapshot on the old configuration
-- Restart process with more threads (on larger hardware)
-- During load, keys are naturally mapped to new `shard_id`
-- No online background migration lock/stall needed
+| Feature | Redis | Dragonfly |
+| :--- | :--- | :--- |
+| **Threading** | Single-threaded core | Multi-threaded (Shared-nothing) |
+| **Resharding** | Slot-by-slot (Network) | Multi-threaded streaming (Parallel) |
+| **Scaling** | Horizontal (Cluster) first | Vertical (Core) first |
+| **Eviction** | Approx. LRU | 2Q (Recency + Frequency) |
+| **Transaction** | Pseudo (no rollback) | VLL (Atomic multi-shard) |
 
 ---
 
-### Characteristics
-
-- Happens **during load inside a single process**
-- Avoids the nightmare of network-based online migration
-- Requires brief downtime (restart) for the upgraded node  
-
----
-
-## (B) Horizontal Scaling (Multi-node)
-
-Dragonfly (like Redis) can scale across nodes, but:
-
-- It does **not rely heavily on cluster mode like Redis**
-- Focus is more on **vertical scaling efficiency**
-
----
-
-### Key Difference vs Redis
-
-| Aspect | Redis | Dragonfly |
-|------|------|-----------|
-| Scaling Strategy | Horizontal (cluster) | Vertical-first (also supports Swarm) |
-| Resharding | Slot migration (network) | Load-time mapping / Optimized Network (Swarm) |
-| Cost | High (network + coordination) | Lower for vertical, optimized for horizontal |
-| Complexity | High | Lower |
-
----
-
-## 14.3 The Real Trade-off
-
-### Redis
-
-**Pros:**
-
-- Mature cluster model  
-- True horizontal scaling  
-
-**Cons:**
-
-- Resharding is expensive  
-- Operational complexity  
-
----
-
-### Dragonfly
-
-**Pros:**
-
-- Extremely efficient on single node  
-- Better CPU utilization  
-- Faster internal resharding  
-
-**Cons:**
-
-- Cross-node scaling story is less mature  
-- Still requires redistribution when shard count changes  
-
----
-
-## 14.4 Advanced Insight (Important for Interview)
-
-### Problem with `hash(key) % N`
-
-When `N` changes:
-
-```
-hash(key) % 4 ≠ hash(key) % 8
-```
-
-→ Almost all keys need to move
-
----
-
-### Better Approach (Used in Many Systems)
-
-**Consistent Hashing**
-
-- Minimizes key movement  
-- Only a small portion of keys are remapped  
-
-Redis Cluster partially solves this using **hash slots**.
-
----
-
-## 14.5 Final Takeaway
-
-- Redis scales **horizontally** but pays the cost in resharding complexity  
-- Dragonfly scales **vertically first**, maximizing single-node performance  
-
-> Redis optimizes for distribution  
-> Dragonfly optimizes for locality and CPU efficiency  
-
----
-
-## 14.6 Interview One-Liner
-
-> Redis uses hash slots and performs explicit resharding across nodes, which is operationally expensive, while Dragonfly focuses on vertical scaling with shard-per-thread design and performs faster in-memory redistribution when scaling within a node.
+## 6. Interview One-Liner
+> Dragonfly achieves 25x Redis throughput by using a **shared-nothing, multi-threaded architecture** that assigns data shards to specific CPU cores, eliminating lock contention and maximizing vertical scalability via modern algorithms like **DashTable** and **VLL**.

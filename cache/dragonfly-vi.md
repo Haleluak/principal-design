@@ -1,166 +1,84 @@
-# 14. Phân Đoạn Lại Dữ Liệu & Mở Rộng Hệ Thống (Redis vs Dragonfly)
+# Dragonfly: Kho Lưu Trữ Dữ Liệu In-Memory Hiện Đại (Deep Dive)
 
-Mở rộng không chỉ là việc thêm node — 
-đó là câu chuyện về **cách dữ liệu được phân phối lại (resharding)** khi cụm (cluster) thay đổi.
-
----
-
-## 14.1 Mở Rộng & Resharding Trong Redis
-
-### Kiến trúc
-
-Redis Cluster:
-
-- Sử dụng **16384 hash slots**
-- Mỗi key được ánh xạ vào 1 slot:
-
-```c
-slot = CRC16(key) % 16384
-```
-
-- Mỗi node sở hữu một tập hợp các slots.
+DragonflyDB được thành lập bởi Roman Gershman (cựu Principal Engineer thuộc team ElastiCache của AWS) với mục tiêu giải quyết triệt để các hạn chế về kiến trúc của Redis để xây dựng "Kho lưu trữ dữ liệu In-Memory nhanh nhất thế giới."
 
 ---
 
-### Khi Thêm Node
+## 1. Kiến Trúc Cốt Lõi: Shared-Nothing & Đa Luồng (Multi-Threading)
 
-Khi một node mới được thêm vào:
+Khác với Redis (vốn dĩ chạy đơn luồng cho việc xử lý lệnh), Dragonfly được xây dựng từ đầu để tận dụng tối đa phần cứng máy chủ đa nhân hiện đại.
 
-1. Cluster sẽ gán một số slot từ các node hiện có cho node mới.
-2. Dữ liệu phải được **di cư (migrate) theo từng slot**.
+### Thiết kế Shared-Nothing (Không chia sẻ gì cả)
+- **Phân đoạn Dataset:** Dữ liệu được chia thành **N shard (phân đoạn)**, với `N <= số lượng thread` (luồng) của server.
+- **Quy tắc Sở hữu Độc lập:** Mỗi shard được quản lý bởi duy nhất **một thread cố định**.
+- **Không xảy ra tranh chấp khóa (Lock Contention):** Vì mỗi thread có quyền sở hữu tuyệt đối đối với shard của mình, nó không cần dùng tới `locks` (mutex) để xử lý các lệnh, tránh được hiện tượng thắt cổ chai do tranh giành tài nguyên vốn thường thấy trong các hệ thống đa luồng truyền thống.
 
----
-
-### Quy trình Resharding
-
-```
-Node Nguồn ────► Node Đích
- (slot X)         (slot X)
-```
-
-Các bước:
-
-- Khóa (lock) slot tạm thời.
-- Di chuyển từng key một qua mạng.
-- Cập nhật metadata của toàn Cluster.
+### Giao tiếp giữa các luồng (Message Bus)
+- Các thread trong Dragonfly giao tiếp với nhau qua một **Message Bus** (ý tưởng tương tự như **Go Channels**).
+- Ví dụ: Nếu client kết nối tới Thread A nhưng muốn truy cập dữ liệu thuộc Shard B (do Thread B quản lý), Thread A sẽ gửi một thông điệp qua Bus để yêu cầu Thread B xử lý.
 
 ---
 
-### Đặc điểm
+## 2. Chiến Lược Mở Rộng: Ưu Tiên Chiều Dọc (Vertical-First)
 
-- **Online nhưng không hề "miễn phí"**:
-  - Gây gánh nặng cho mạng (Network overhead).
-  - Tăng độ trễ (latency) trong quá trình di cư.
-- Cần sự điều phối (orchestration) cực kỳ cẩn thận.
+Dragonfly tập trung tối ưu hóa **Vertical Scaling** (mở rộng trên một node duy nhất) trước khi tính đến mở rộng chiều ngang (Cluster).
 
----
-
-### Hạn chế cốt lõi
-
-> Resharding trong Redis là một công việc **thủ công/tường minh (explicit) và cực kỳ nặng nề về vận hành.**
+### Tại sao ưu tiên chiều dọc? (Định luật Căn bậc hai - Root Square Law)
+- **Hiệu quả phần cứng:** Một máy chủ cấu hình cực lớn thường tiết kiệm chi phí phần cứng hơn ~20-30% so với một cụm gồm nhiều máy chủ nhỏ có tổng dung lượng tương đương.
+- **Sự đơn giản trong vận hành:** Không cần quản lý Cluster phức tạp, không cần Sentinel, và không phải đối mặt với các cuộc "di cư" dữ liệu (slot migration) đắt đỏ giữa các node mạng cho đến khi thực sự cần thiết.
 
 ---
 
-## 14.2 Mở Rộng & Resharding Trong Dragonfly
+## 3. Các Thuật Toán & Cấu Trúc Dữ Liệu "Cutting Edge"
 
-Dragonfly có **hai cấp độ mở rộng**:
+Dragonfly thay thế các thuật toán cũ kỹ của Redis bằng những công nghệ tiên tiến nhất:
 
----
+### Nghị thức VLL (Very Lightweight Locking)
+- Được sử dụng để thực hiện **Atomic Transactions** (giao dịch nguyên tử) trên nhiều shard cùng lúc.
+- Mạnh mẽ và chuẩn xác hơn cơ chế `MULTI/EXEC` của Redis (vốn không hỗ trợ rollback thực sự nếu một lệnh lẻ tẻ bị lỗi).
 
-## (A) Mở Rộng Theo Chiều Dọc (Trong Một Node đơn lẻ)
+### Chính sách giải phóng bộ nhớ 2Q (Eviction Policy)
+- Redis sử dụng **Approximated LRU** (Ít sử dụng gần đây nhất - mang tính xấp xỉ), thường gặp khó khăn với các mẫu truy cập dạng "Long Tail".
+- Dragonfly sử dụng thuật toán **2Q**, theo dõi cả **tính mới (Recency)** và **tần suất (Frequency)** để đưa ra quyết định chính xác hơn về việc xóa key nào khi hết bộ nhớ.
 
-Đây là nơi Dragonfly thực sự tỏa sáng (Vertical Scaling).
-
-### Cơ chế
-
-- Dữ liệu được chia thành **N phân đoạn (shards)**.
-- Mỗi shard được sở hữu và xử lý bởi một **Thread (luồng)** riêng.
-
-```
-shard_id = hash(key) % N
-```
+### DashTable
+- Dragonfly sử dụng **DashTable** để lưu trữ (key, value) chính.
+- Thử nghiệm cho thấy DashTable tốn **ít hơn ~50% bộ nhớ** so với HashTable dạng chaining của Redis và giúp CPU truy cập dữ liệu nhanh hơn nhờ tối ưu hóa Cache Locality.
 
 ---
 
-### Khi Số Luồng Thay Đổi
+## 4. Phân Đoạn Lại Dữ Liệu & Mở Rộng (Redis vs Dragonfly)
 
-Nếu bạn tăng số thread (ví dụ từ 4 core lên 8 core):
+### 4.1 Redis Scaling: Di Cư Slot (Slot Migration)
+Redis Cluster sử dụng **16384 hash slots**.
+- **Cơ chế:** Việc di cư dữ liệu diễn ra theo từng **slot một**. Hệ thống phải di chuyển tường minh từng key từ bộ nhớ của node này sang node kia thông qua mạng.
+- **Chi phí:** Vì Redis đơn luồng, nó phải cân bằng giữa việc di cư dữ liệu và xử lý các lệnh từ client. Đây là một công việc **nặng nề về vận hành (operator-heavy)**.
 
-```
-Cũ: N = 4
-Mới: N = 8
-```
+### 4.2 Dragonfly Scaling: Luồng Dữ Liệu Đa Luồng (Multi-Threaded streaming)
+Dragonfly xử lý việc phân bổ lại dữ liệu vượt trội hơn nhờ kiến trúc **Shared-Nothing đa luồng**:
 
-→ Vị trí ánh xạ của Shard sẽ thay đổi hoàn toàn (`hash(key) % 4` khác `hash(key) % 8`).
+#### A. Phân đoạn theo chiều dọc (Trong 1 Node)
+- Khi thay đổi số nhân CPU (ví dụ: nâng cấp từ 4 lên 8 threads trên cùng một máy), Dragonfly thực hiện **Dàn xếp lại trong tiến trình (In-Process Redistribution)** ngay khi khởi động.
+- Vì tất cả nằm trong cùng một không gian RAM, các key được ánh xạ ngay lập tức và song song vào các shard/thread mới. Không tốn chi phí mạng.
 
----
-
-### Giải pháp của Dragonfly
-
-Dragonfly xử lý vấn đề này rất gọn vì việc mở rộng chiều dọc thường là một hoạt động **Offline Upgrade**:
-
-- Lưu snapshot cấu hình cũ.
-- Khởi động lại process với nhiều threads hơn (trên phần cứng mạnh hơn).
-- Trong quá trình nạp lại dữ liệu (load), các key sẽ tự động được ánh xạ vào `shard_id` mới.
-- **Không cần cơ chế di cư ngầm gây đứng máy (stall/lock)** như Redis Cluster.
+#### B. Phân đoạn theo chiều ngang (Swarm Mode)
+- **Truyền dữ liệu song song:** Khác với Redis (một Core duy nhất xử lý cả di cư lẫn lệnh), Dragonfly sử dụng **nhiều thread** để truyền (stream) các phân đoạn dữ liệu song song.
+- **Di cư Thread-to-Thread:** Các luồng (thread) ở node nguồn sẽ truyền trực tiếp các shard cho các luồng tương ứng ở node đích thông qua nhiều kết nối TCP song song.
+- **Hiệu quả:** Điều này giúp quá trình resharding nhanh hơn **nhiều bậc (orders of magnitude)** và giảm thiểu hiện tượng "đứng máy" (latency stall) thường thấy trong các cụm Redis.
 
 ---
 
-### Đặc điểm
+## 5. So Sánh: Redis vs Dragonfly
 
-- Diễn ra **trong lúc nạp dữ liệu vào bộ nhớ** của một tiến trình duy nhất.
-- Tránh được "cơn ác mộng" di cư dữ liệu online qua mạng.
-- Cần một khoảng thời gian dừng (downtime) rất ngắn để khởi động lại node đã nâng cấp.
-
----
-
-## (B) Mở Rộng Theo Chiều Ngang (Nhiều Nodes)
-
-Dragonfly cũng hỗ trợ cụm đa node (mode Swarm), nhưng:
-
-- Nó **không phụ thuộc quá nhiều vào Cluster mode như Redis**.
-- Tập trung tối đa vào hiệu năng **Vertical Scaling** (một server cực lớn).
-
----
-
-### So Sánh Nhanh Redis vs Dragonfly
-
-| Khía cạnh | Redis | Dragonfly |
+| Đặc tính | Redis | Dragonfly |
 | :--- | :--- | :--- |
-| **Chiến lược mở rộng** | Chiều ngang (Cluster) | Ưu tiên chiều dọc (cũng hỗ trợ Swarm) |
-| **Resharding** | Di cư Slot (qua mạng) | Ánh xạ lúc nạp / Network tối ưu (Swarm) |
-| **Chi phí** | Cao (Mạng + Điều phối) | Thấp cho chiều dọc, tối ưu cho chiều ngang |
-| **Độ phức tạp** | Cao | Thấp |
+| **Luồng (Threading)** | Đơn luồng (Single-thread) | Đa luồng (Shared-nothing) |
+| **Resharding** | Di cư từng Slot (Mạng) | Truyền đa luồng song song |
+| **Mở rộng** | Ưu tiên chiều ngang (Cluster) | Ưu tiên chiều dọc (Core/RAM) |
+| **Xóa key (Eviction)** | Approx. LRU | 2Q (Mới + Tần suất) |
+| **Giao dịch** | Giả cầy (không rollback) | VLL (Atomic đa shard) |
 
 ---
 
-## 14.3 Đánh Đổi Thực Tế
-
-### Redis
-
-**Ưu điểm:**
-- Mô hình Cluster cực kỳ trưởng thành.
-- Khả năng mở rộng chiều ngang thực thụ (hàng nghìn node).
-
-**Nhược điểm:**
-- Resharding rất đắt đỏ.
-- Vận hành phức tạp (cần Redis Sentinel hoặc Cluster manager).
-
----
-
-### Dragonfly
-
-**Ưu điểm:**
-- Hiệu năng cực đỉnh trên một node (tận dụng hết số Core CPU).
-- Tận dụng CPU tốt hơn nhờ kiến trúc đa luồng.
-- Phân đoạn lại dữ liệu trong bộ nhớ cực nhanh.
-
-**Nhược điểm:**
-- Câu chuyện mở rộng đa node (multi-node) vẫn đang hoàn thiện.
-- Vẫn cần ánh xạ lại dữ liệu khi số lượng shard thay đổi.
-
----
-
-## 14.4 Takeaway Phỏng Vấn (One-Liner)
-
-> Redis sử dụng cơ chế hash slots và thực hiện resharding tường minh qua mạng khi mở rộng ngang, điều này gây tốn kém tài nguyên vận hành. Ngược lại, Dragonfly tối ưu cho mở rộng dọc với thiết kế shard-per-thread, cho phép phân bổ lại dữ liệu cực nhanh trong bộ nhớ và tránh các vấn đề về mạng khi tăng core CPU trên một node.
+## 5. Interview One-Liner
+> Dragonfly đạt throughput gấp 25 lần Redis nhờ kiến trúc **shared-nothing đa luồng**, phân chia dữ liệu vào các shard độc lập cho từng nhân CPU, kết hợp với các thuật toán hiện đại như **DashTable** và **VLL** để loại bỏ tranh chấp khóa và tối ưu hóa bộ nhớ.
