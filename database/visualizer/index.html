@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostgreSQL B-Tree Visualizer</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+</head>
+<body class="dark-theme">
+    <div class="app-container">
+        <header>
+            <h1>PostgreSQL Index Internals <span class="badge" style="background:#336791; color:white;">Postgres Mode</span></h1>
+            <p>Visualizing Meta Page, Line Pointers & Heap Pointers (CTIDs)</p>
+        </header>
+
+        <section class="controls card">
+            <div class="input-group">
+                <input type="number" id="userId" placeholder="Index Key (int)" min="1">
+                <input type="text" id="payload" placeholder="Optional Value">
+                <button id="insertBtn" class="primary-btn">CREATE INDEX ENTRY</button>
+            </div>
+            <div class="stats">
+                <div class="stat-item">Total Pages: <span id="totalPages">2</span></div>
+                <div class="stat-item">Root At: Page #<span id="rootAt">1</span></div>
+                <div class="stat-item">Meta Page: #0</div>
+            </div>
+        </section>
+
+        <main class="visualizer-grid">
+            <!-- Cây logic -->
+            <div class="logical-view card">
+                <h2>Logical B-Tree & Meta Page</h2>
+                <div id="treeContainer" class="tree-canvas">
+                    <!-- Tree rendered here -->
+                </div>
+            </div>
+
+            <!-- Page vật lý -->
+            <div class="physical-view card">
+                <h2>Physical Page Internal (Postgres Format)</h2>
+                <div id="pageContainer" class="page-list">
+                    <!-- Pages rendered here -->
+                </div>
+            </div>
+        </main>
+
+        <section id="pageInspector" class="card inspector hidden">
+            <h2>🔎 Inspecting Page: <span id="inspectingId">None</span></h2>
+            <div class="inspector-content" id="inspectDetails">
+                Click a page to see its Line Pointers & Data Tuples.
+            </div>
+        </section>
+
+        <section class="log-view card">
+            <h2>PostgreSQL Backend Logs</h2>
+            <div id="logConsole" class="terminal">
+                <p class="log-entry system-msg">> Postgres Instance Started.</p>
+                <p class="log-entry">> Page 0 initialized as Meta Page.</p>
+                <p class="log-entry">> B-Tree Index starts at Page 1.</p>
+            </div>
+        </section>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
